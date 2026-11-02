@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"k8s.io/klog/v2"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -53,14 +54,28 @@ func NewCDIHandler(config *Config) (*CDIHandler, error) {
 	return handler, nil
 }
 
+func sortedEnvList(envs map[string]string) []string {
+	if len(envs) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(envs))
+	for k := range envs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, fmt.Sprintf("%s=%s", k, envs[k]))
+	}
+	return out
+}
+
 func (cdi *CDIHandler) CreateCommonSpecFile(envs map[string]string, commonMounts []*cdispec.Mount) error {
 	commonEnv := []string{
 		fmt.Sprintf("KUBERNETES_NODE_NAME=%s", os.Getenv("NODE_NAME")),
 		fmt.Sprintf("DRA_RESOURCE_DRIVER_NAME=%s", DriverName),
 	}
-	for env, value := range envs {
-		commonEnv = append(commonEnv, fmt.Sprintf("%s=%s", env, value))
-	}
+	commonEnv = append(commonEnv, sortedEnvList(envs)...)
 
 	spec := &cdispec.Spec{
 		Kind: cdiKind,
@@ -91,12 +106,15 @@ func (cdi *CDIHandler) CreateCommonSpecFile(envs map[string]string, commonMounts
 	return cdi.cache.WriteSpec(spec, specName)
 }
 
-func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, devices PreparedDevices) error {
+func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, devices PreparedDevices, claimEnvs map[string]string) error {
 	specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 
 	spec := &cdispec.Spec{
 		Kind:    cdiKind,
 		Devices: []cdispec.Device{},
+		ContainerEdits: cdispec.ContainerEdits{
+			Env: sortedEnvList(claimEnvs),
+		},
 	}
 
 	for _, device := range devices {

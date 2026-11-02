@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -44,6 +45,7 @@ func TestProbeTPUHardware(t *testing.T) {
 		wantDevDir     string
 		wantChips      int
 		wantGeneration string
+		wantChipList   []tpuChip
 		wantNoTPUErr   bool
 	}{
 		{
@@ -57,6 +59,12 @@ func TestProbeTPUHardware(t *testing.T) {
 			},
 			wantDevDir: devDirectory,
 			wantChips:  4,
+			wantChipList: []tpuChip{
+				{name: "accel0", deviceNodes: []string{"accel0"}},
+				{name: "accel1", deviceNodes: []string{"accel1"}},
+				{name: "accel2", deviceNodes: []string{"accel2"}},
+				{name: "accel3", deviceNodes: []string{"accel3"}},
+			},
 		},
 		{
 			name: "vfio devices of a recognized tpu generation",
@@ -72,6 +80,48 @@ func TestProbeTPUHardware(t *testing.T) {
 			wantDevDir:     devDirectoryVfio,
 			wantChips:      2,
 			wantGeneration: "v6e",
+			wantChipList: []tpuChip{
+				{name: "12", deviceNodes: []string{"12"}},
+				{name: "13", deviceNodes: []string{"13"}},
+			},
+		},
+		{
+			// A v7x chip is two PCI functions of one slot, each in its own IOMMU
+			// group. The group numbers need not follow the function numbers.
+			name: "vfio functions of one v7x chip are one chip",
+			files: map[string]string{
+				"dev/vfio/vfio": "",
+				"dev/vfio/0":    "",
+				"dev/vfio/1":    "",
+				"sys/kernel/iommu_groups/0/devices/0000:00:03.1/vendor": googlePCIVendorID + "\n",
+				"sys/kernel/iommu_groups/0/devices/0000:00:03.1/device": "0x0076\n", // v7x
+				"sys/kernel/iommu_groups/1/devices/0000:00:03.0/vendor": googlePCIVendorID + "\n",
+				"sys/kernel/iommu_groups/1/devices/0000:00:03.0/device": "0x0076\n", // v7x
+			},
+			wantDevDir:     devDirectoryVfio,
+			wantChips:      1,
+			wantGeneration: "v7x",
+			wantChipList: []tpuChip{
+				{name: "0", deviceNodes: []string{"0", "1"}},
+			},
+		},
+		{
+			name: "vfio groups are ordered by number, not by name",
+			files: map[string]string{
+				"dev/vfio/2":  "",
+				"dev/vfio/10": "",
+				"sys/kernel/iommu_groups/2/devices/0000:00:05.0/vendor":  googlePCIVendorID + "\n",
+				"sys/kernel/iommu_groups/2/devices/0000:00:05.0/device":  "0x006f\n",
+				"sys/kernel/iommu_groups/10/devices/0000:00:06.0/vendor": googlePCIVendorID + "\n",
+				"sys/kernel/iommu_groups/10/devices/0000:00:06.0/device": "0x006f\n",
+			},
+			wantDevDir:     devDirectoryVfio,
+			wantChips:      2,
+			wantGeneration: "v6e",
+			wantChipList: []tpuChip{
+				{name: "2", deviceNodes: []string{"2"}},
+				{name: "10", deviceNodes: []string{"10"}},
+			},
 		},
 		{
 			name: "vfio device of an unrecognized generation is still counted",
@@ -131,6 +181,9 @@ func TestProbeTPUHardware(t *testing.T) {
 			if got.generation != tt.wantGeneration {
 				t.Errorf("probeTPUHardware() generation = %q, want %q", got.generation, tt.wantGeneration)
 			}
+			if tt.wantChipList != nil && !reflect.DeepEqual(got.chips, tt.wantChipList) {
+				t.Errorf("probeTPUHardware() chips = %v, want %v", got.chips, tt.wantChipList)
+			}
 		})
 	}
 }
@@ -149,6 +202,7 @@ func TestTpuGenerationFromPCIIDs(t *testing.T) {
 		{name: "v5e", device: "0x0063", want: "v5lite", wantOK: true},
 		{name: "v5p", device: "0x0062", want: "v5p", wantOK: true},
 		{name: "v6e", device: "0x006f", want: "v6e", wantOK: true},
+		{name: "v7x", device: "0x0076", want: "v7x", wantOK: true},
 		{name: "unrecognized device id", device: "0xffff", wantOK: false},
 	}
 
@@ -221,6 +275,16 @@ func TestCompleteLabelsFromHardware(t *testing.T) {
 				AcceleratorCountLabel: "3",
 			},
 		},
+		{
+			name:     "same PCI family generation alias fills count and topology",
+			labels:   map[string]string{AcceleratorLabel: "tpu7"},
+			hardware: &tpuHardware{devDirectory: devDirectoryVfio, chipCount: 4, generation: "v7x"},
+			want: map[string]string{
+				AcceleratorLabel:      "tpu7",
+				AcceleratorCountLabel: "4",
+				TopologyLabel:         "2x2",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -235,5 +299,65 @@ func TestCompleteLabelsFromHardware(t *testing.T) {
 				t.Errorf("completeLabelsFromHardware() got = %v, want %v", tt.labels, tt.want)
 			}
 		})
+	}
+}
+
+func TestProbeTPUHardwareFourChipV7x(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		"dev/vfio/vfio": "",
+		"dev/vfio/0":    "",
+		"dev/vfio/1":    "",
+		"dev/vfio/2":    "",
+		"dev/vfio/3":    "",
+		"dev/vfio/4":    "",
+		"dev/vfio/5":    "",
+		"dev/vfio/6":    "",
+		"dev/vfio/7":    "",
+		"sys/kernel/iommu_groups/0/devices/0000:00:03.0/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/0/devices/0000:00:03.0/device": "0x0076\n",
+		"sys/kernel/iommu_groups/1/devices/0000:00:03.1/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/1/devices/0000:00:03.1/device": "0x0076\n",
+		"sys/kernel/iommu_groups/2/devices/0000:00:04.0/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/2/devices/0000:00:04.0/device": "0x0076\n",
+		"sys/kernel/iommu_groups/3/devices/0000:00:04.1/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/3/devices/0000:00:04.1/device": "0x0076\n",
+		"sys/kernel/iommu_groups/4/devices/0000:00:05.0/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/4/devices/0000:00:05.0/device": "0x0076\n",
+		"sys/kernel/iommu_groups/5/devices/0000:00:05.1/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/5/devices/0000:00:05.1/device": "0x0076\n",
+		"sys/kernel/iommu_groups/6/devices/0000:00:06.0/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/6/devices/0000:00:06.0/device": "0x0076\n",
+		"sys/kernel/iommu_groups/7/devices/0000:00:06.1/vendor": googlePCIVendorID + "\n",
+		"sys/kernel/iommu_groups/7/devices/0000:00:06.1/device": "0x0076\n",
+	})
+
+	got, err := probeTPUHardware(root)
+	if err != nil {
+		t.Fatalf("probeTPUHardware: %v", err)
+	}
+	wantChips := []tpuChip{
+		{name: "0", deviceNodes: []string{"0", "1"}},
+		{name: "2", deviceNodes: []string{"2", "3"}},
+		{name: "4", deviceNodes: []string{"4", "5"}},
+		{name: "6", deviceNodes: []string{"6", "7"}},
+	}
+	if got.chipCount != 4 || got.generation != "v7x" || !reflect.DeepEqual(got.chips, wantChips) {
+		t.Errorf("probeTPUHardware() = %+v, want 4 v7x chips %v", got, wantChips)
+	}
+}
+
+func TestGenerationFamilyHelpers(t *testing.T) {
+	if !supportsSingleChipAllocation("v7x") || !supportsSingleChipAllocation("v7") {
+		t.Error("expected v7x and v7 to support single-chip allocation")
+	}
+	if supportsSingleChipAllocation("v6e") || supportsSingleChipAllocation("v4") {
+		t.Error("expected v6e and v4 not to support single-chip allocation")
+	}
+	if !sameTPUGenerationFamily("v7x", "v7") || !sameTPUGenerationFamily("v4", "v4lite") {
+		t.Error("expected generations of the same PCI family to match")
+	}
+	if sameTPUGenerationFamily("v7x", "v6e") {
+		t.Error("expected distinct PCI families not to match")
 	}
 }

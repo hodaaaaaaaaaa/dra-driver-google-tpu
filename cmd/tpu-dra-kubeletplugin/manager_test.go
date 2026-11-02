@@ -17,24 +17,20 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	resourceapi "k8s.io/api/resource/v1"
 )
 
-// fakeDevDir creates a directory containing the given fake TPU device files.
-func fakeDevDir(t *testing.T, names ...string) string {
-	t.Helper()
-	dir := t.TempDir()
+// singleNodeChips builds one chip per device name, each with that one device node.
+func singleNodeChips(names ...string) []tpuChip {
+	chips := make([]tpuChip, 0, len(names))
 	for _, n := range names {
-		if err := os.WriteFile(filepath.Join(dir, n), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		chips = append(chips, tpuChip{name: n, deviceNodes: []string{n}})
 	}
-	return dir
+	return chips
 }
 
 func enumerate(t *testing.T, nodeName, tpuGen string, devNames ...string) AllocatableDevices {
@@ -42,7 +38,8 @@ func enumerate(t *testing.T, nodeName, tpuGen string, devNames ...string) Alloca
 	t.Setenv("NODE_NAME", nodeName)
 	tm := &tpuManager{
 		tpuGen:       tpuGen,
-		DevDirectory: fakeDevDir(t, devNames...),
+		DevDirectory: devDirectory,
+		chips:        singleNodeChips(devNames...),
 		tpuChipCount: len(devNames),
 	}
 	devs, err := tm.enumerateAllPossibleTpuDevices()
@@ -136,48 +133,179 @@ func TestGetDeviceTopologyOptional(t *testing.T) {
 }
 
 func TestDeviceNodeContainerEdits(t *testing.T) {
-	v4 := (&tpuManager{DevDirectory: "/dev", tpuGen: "v4"}).DeviceNodeContainerEdits("accel0")
-	if len(v4) != 1 {
-		t.Errorf("v4: expected 1 device node, got %d", len(v4))
+	tests := []struct {
+		name   string
+		tm     *tpuManager
+		device string
+		want   []string
+	}{
+		{
+			name:   "v4 accel device",
+			tm:     &tpuManager{DevDirectory: devDirectory, tpuGen: "v4", chips: singleNodeChips("accel0")},
+			device: "accel0",
+			want:   []string{"/dev/accel0"},
+		},
+		{
+			name:   "v6e vfio device also gets the vfio container node",
+			tm:     &tpuManager{DevDirectory: devDirectoryVfio, tpuGen: "v6e", chips: singleNodeChips("0", "1")},
+			device: "1",
+			want:   []string{"/dev/vfio/1", "/dev/vfio/vfio"},
+		},
+		{
+			name: "v7x chip made of two vfio devices gets both and the container node",
+			tm: &tpuManager{DevDirectory: devDirectoryVfio, tpuGen: "v7x", chips: []tpuChip{
+				{name: "0", deviceNodes: []string{"0", "1"}},
+			}},
+			device: "0",
+			want:   []string{"/dev/vfio/0", "/dev/vfio/1", "/dev/vfio/vfio"},
+		},
+		{
+			name:   "unknown device gets nothing",
+			tm:     &tpuManager{DevDirectory: devDirectoryVfio, tpuGen: "v6e", chips: singleNodeChips("0")},
+			device: "7",
+			want:   nil,
+		},
 	}
-
-	v6e := (&tpuManager{DevDirectory: "/dev", tpuGen: "v6e"}).DeviceNodeContainerEdits("0")
-	if len(v6e) != 2 {
-		t.Errorf("v6e: expected 2 device nodes (incl. %s), got %d", defaultDeviceID, len(v6e))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, node := range tt.tm.DeviceNodeContainerEdits(tt.device) {
+				if node.HostPath != node.Path {
+					t.Errorf("device node %s is mounted at %s", node.HostPath, node.Path)
+				}
+				got = append(got, node.Path)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("DeviceNodeContainerEdits(%q) = %v, want %v", tt.device, got, tt.want)
+			}
+		})
 	}
 }
 
 func TestValidateTpuRequest(t *testing.T) {
-	tm := &tpuManager{tpuChipCount: 4}
+	tm := &tpuManager{tpuChipCount: 4, tpuGen: "v6e"}
 	if err := tm.ValidateTpuRequest([]string{"a", "b", "c", "d"}); err != nil {
 		t.Errorf("expected full-chip request to pass: %v", err)
+	}
+	if err := tm.ValidateTpuRequest([]string{"a"}); err == nil {
+		t.Error("expected single-chip request on v6e 4-chip node to be rejected")
 	}
 	if err := tm.ValidateTpuRequest([]string{"a", "b"}); err == nil {
 		t.Error("expected partial request to be rejected")
 	}
+
+	singleHostV7x := &tpuManager{
+		tpuChipCount: 4,
+		tpuGen:       "v7x",
+		nodeLabels: map[string]string{
+			AcceleratorLabel:      "tpu7x",
+			AcceleratorCountLabel: "4",
+			TopologyLabel:         "2x2x1",
+		},
+	}
+	if err := singleHostV7x.ValidateTpuRequest([]string{"2"}); err != nil {
+		t.Errorf("expected 1-chip request on single-host v7x 4-chip node to pass: %v", err)
+	}
+	if err := singleHostV7x.ValidateTpuRequest([]string{"0", "2", "4", "6"}); err != nil {
+		t.Errorf("expected full 4-chip request on single-host v7x node to pass: %v", err)
+	}
+	if err := singleHostV7x.ValidateTpuRequest([]string{"0", "2"}); err == nil {
+		t.Error("expected 2-of-4 partial request on v7x node to be rejected")
+	}
+
+	multiHostV7x := &tpuManager{
+		tpuChipCount: 4,
+		tpuGen:       "v7x",
+		nodeLabels: map[string]string{
+			AcceleratorLabel:      "tpu7x",
+			AcceleratorCountLabel: "4",
+			TopologyLabel:         "4x4x4",
+		},
+	}
+	if err := multiHostV7x.ValidateTpuRequest([]string{"0"}); err == nil {
+		t.Error("expected 1-chip request on multi-host v7x slice to be rejected")
+	}
+}
+
+func TestEnvsForClaimSingleChipOnFourChipV7x(t *testing.T) {
+	t.Setenv(NodeIPEnv, "10.0.0.9")
+	labels := map[string]string{
+		AcceleratorLabel:      "tpu7x",
+		AcceleratorCountLabel: "4",
+		TopologyLabel:         "2x2x1",
+	}
+	chips := []tpuChip{
+		{name: "0", deviceNodes: []string{"0", "1"}},
+		{name: "2", deviceNodes: []string{"2", "3"}},
+		{name: "4", deviceNodes: []string{"4", "5"}},
+		{name: "6", deviceNodes: []string{"6", "7"}},
+	}
+	tm, err := NewTPUManager(labels, devDirectoryVfio, chips)
+	if err != nil {
+		t.Fatalf("NewTPUManager: %v", err)
+	}
+
+	oneChipEnvs, err := tm.envsForClaim(1)
+	if err != nil {
+		t.Fatalf("envsForClaim(1): %v", err)
+	}
+	if oneChipEnvs["TPU_ACCELERATOR_TYPE"] != "tpu7x-2" ||
+		oneChipEnvs["TPU_TOPOLOGY"] != "1x1x1" ||
+		oneChipEnvs["TPU_CHIPS_PER_HOST_BOUNDS"] != "1,1,1" ||
+		oneChipEnvs["TPU_HOST_BOUNDS"] != "1,1,1" ||
+		oneChipEnvs["TPU_WORKER_ID"] != "0" ||
+		oneChipEnvs["TPU_WORKER_HOSTNAMES"] != "localhost" ||
+		oneChipEnvs["VBAR_CONTROL_SERVICE_URL"] != "10.0.0.9:8353" {
+		t.Errorf("unexpected 1-chip envs: %v", oneChipEnvs)
+	}
+
+	allChipEnvs, err := tm.envsForClaim(4)
+	if err != nil {
+		t.Fatalf("envsForClaim(4): %v", err)
+	}
+	if allChipEnvs["TPU_ACCELERATOR_TYPE"] != "tpu7x-8" ||
+		allChipEnvs["TPU_TOPOLOGY"] != "2x2x1" ||
+		allChipEnvs["TPU_CHIPS_PER_HOST_BOUNDS"] != "2,2,1" {
+		t.Errorf("unexpected 4-chip envs: %v", allChipEnvs)
+	}
 }
 
 func TestEnumerateAllPossibleTpuDevices(t *testing.T) {
-	dir := t.TempDir()
-	// v4-style naming (accelN) is matched outside the vfio directory.
-	for _, name := range []string{"accel0", "accel1", "not-a-device"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte{}, 0600); err != nil {
-			t.Fatalf("WriteFile: %v", err)
-		}
+	t.Setenv("NODE_NAME", "node-a")
+	// A v7x node with two chips of two vfio devices each publishes two devices,
+	// named after each chip's first device node, in chip order.
+	chips := []tpuChip{
+		{name: "0", deviceNodes: []string{"0", "1"}},
+		{name: "2", deviceNodes: []string{"2", "3"}},
 	}
-	tm := &tpuManager{DevDirectory: dir, tpuChipCount: 2, tpuGen: "v4"}
+	tm := &tpuManager{DevDirectory: devDirectoryVfio, tpuChipCount: 2, tpuGen: "v7x", chips: chips}
 
 	devices, err := tm.enumerateAllPossibleTpuDevices()
 	if err != nil {
 		t.Fatalf("enumerateAllPossibleTpuDevices: %v", err)
 	}
 	if len(devices) != 2 {
-		t.Errorf("expected 2 matched devices, got %d", len(devices))
+		t.Fatalf("expected 2 devices, got %d", len(devices))
+	}
+	for i, chip := range chips {
+		d, ok := devices[chip.name]
+		if !ok {
+			t.Fatalf("no device named %q in %v", chip.name, devices)
+		}
+		if d.index != i {
+			t.Errorf("device %s has index %d, want %d", chip.name, d.index, i)
+		}
+		if d.tpuGen != "v7x" || d.chipCount != 2 {
+			t.Errorf("device %s = %+v, want tpuGen v7x and chipCount 2", chip.name, d)
+		}
+		if !reflect.DeepEqual(d.deviceNodes, chip.deviceNodes) {
+			t.Errorf("device %s has device nodes %v, want %v", chip.name, d.deviceNodes, chip.deviceNodes)
+		}
 	}
 
-	// Count mismatch is an error.
-	tmBad := &tpuManager{DevDirectory: dir, tpuChipCount: 3, tpuGen: "v4"}
+	// The chip count from the node labels must match the chips found.
+	tmBad := &tpuManager{DevDirectory: devDirectoryVfio, tpuChipCount: 4, tpuGen: "v7x", chips: chips}
 	if _, err := tmBad.enumerateAllPossibleTpuDevices(); err == nil {
-		t.Error("expected error when discovered count != expected chip count")
+		t.Error("expected error when discovered chip count != expected chip count")
 	}
 }

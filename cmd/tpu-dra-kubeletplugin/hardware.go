@@ -21,6 +21,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -55,13 +57,24 @@ var (
 	}
 )
 
+// tpuChip is one TPU chip found on the local host.
+type tpuChip struct {
+	// name identifies the chip on the host and is the ResourceSlice device
+	// name: the name of its first device node ("accel0", or the IOMMU group
+	// number for vfio).
+	name string
+	// deviceNodes are the chip's device files inside devDirectory. One for
+	// most generations; a chip made of several PCI functions, each in its own
+	// IOMMU group, has one per function (see tpuGenerationFamily).
+	deviceNodes []string
+}
+
 // tpuHardware describes the TPU chips found on the local host.
 type tpuHardware struct {
 	// devDirectory holds the character device of every chip.
 	devDirectory string
-	// deviceRegex matches the chip device names inside devDirectory.
-	deviceRegex *regexp.Regexp
-	chipCount   int
+	chips        []tpuChip
+	chipCount    int
 	// generation is the TPU generation read from the PCI ids of the vfio
 	// devices, in the vocabulary AcceleratorGen (see util.go) uses. Empty when
 	// the devices are not bound to vfio-pci (generations up to v4 use
@@ -86,6 +99,14 @@ type tpuGenerationFamily struct {
 	// uses to double check a label another source already provided, never to
 	// pick between the two on its own.
 	generations []string
+	// pciFunctionsPerChip is how many PCI functions one chip of this family
+	// exposes. Each function sits in its own IOMMU group and so has its own
+	// /dev/vfio/<group> node, all of which a container needs to use the chip.
+	// Zero means one.
+	pciFunctionsPerChip int
+	// singleChipAllocatable reports whether a single-host node of this family
+	// allows a ResourceClaim to request 1 chip instead of all chips on the node.
+	singleChipAllocatable bool
 }
 
 // tpuGenerationFamilies is the single source of truth for the TPU generations
@@ -105,7 +126,57 @@ var tpuGenerationFamilies = []tpuGenerationFamily{
 	{pciDeviceID: "0x0063", generations: []string{"v5lite", "v5litepod"}}, // v5e
 	{pciDeviceID: "0x0062", generations: []string{"v5p"}},
 	{pciDeviceID: "0x006f", generations: []string{"v6e"}},
-	// {pciDeviceID: "0x0076", generations: []string{"v7x"}}, // Ironwood, not yet supported by this driver.
+	// Ironwood. Two PCI functions per chip, as in tpu-info's devices_per_chip.
+	{pciDeviceID: "0x0076", generations: []string{"v7x", "v7"}, pciFunctionsPerChip: 2, singleChipAllocatable: true},
+}
+
+// pciFunctionsPerChip returns how many PCI functions one chip of the given
+// generation exposes, 1 when the generation is unknown to this driver.
+func pciFunctionsPerChip(generation string) int {
+	for _, family := range tpuGenerationFamilies {
+		for _, g := range family.generations {
+			if g == generation && family.pciFunctionsPerChip > 0 {
+				return family.pciFunctionsPerChip
+			}
+		}
+	}
+	return 1
+}
+
+// supportsSingleChipAllocation reports whether single-host nodes of the given
+// generation allow a ResourceClaim to allocate a single chip.
+func supportsSingleChipAllocation(generation string) bool {
+	for _, family := range tpuGenerationFamilies {
+		for _, g := range family.generations {
+			if g == generation {
+				return family.singleChipAllocatable
+			}
+		}
+	}
+	return false
+}
+
+// sameTPUGenerationFamily reports whether two generation strings belong to the
+// same hardware family in tpuGenerationFamilies.
+func sameTPUGenerationFamily(a, b string) bool {
+	if a == b {
+		return true
+	}
+	for _, family := range tpuGenerationFamilies {
+		hasA, hasB := false, false
+		for _, g := range family.generations {
+			if g == a {
+				hasA = true
+			}
+			if g == b {
+				hasB = true
+			}
+		}
+		if hasA && hasB {
+			return true
+		}
+	}
+	return false
 }
 
 // isValidTPUGeneration reports whether v is a generation AcceleratorGen (see
@@ -142,22 +213,22 @@ func tpuGenerationFromPCIIDs(device, subsystem string) (string, bool) {
 // probeTPUHardware looks for TPU chips on the local host so that the driver
 // does not have to trust the node labels. TPU generations up to v4 expose one
 // /dev/accel<n> device per chip, later ones are bound to vfio-pci and expose
-// one /dev/vfio/<iommu group> device per chip. root is the host root, it is
-// only meant to be overridden by tests.
+// one /dev/vfio/<iommu group> device per PCI function of a chip. root is the
+// host root, it is only meant to be overridden by tests.
 func probeTPUHardware(root string) (*tpuHardware, error) {
-	if count := countAccelDevices(filepath.Join(root, devDirectory)); count > 0 {
+	if chips := accelChips(filepath.Join(root, devDirectory)); len(chips) > 0 {
 		return &tpuHardware{
 			devDirectory: devDirectory,
-			deviceRegex:  accelDeviceRegex,
-			chipCount:    count,
+			chips:        chips,
+			chipCount:    len(chips),
 		}, nil
 	}
 
-	if count, generation := countVfioTPUDevices(root); count > 0 {
+	if chips, generation := vfioChips(root); len(chips) > 0 {
 		return &tpuHardware{
 			devDirectory: devDirectoryVfio,
-			deviceRegex:  vfioGroupRegex,
-			chipCount:    count,
+			chips:        chips,
+			chipCount:    len(chips),
 			generation:   generation,
 		}, nil
 	}
@@ -165,35 +236,46 @@ func probeTPUHardware(root string) (*tpuHardware, error) {
 	return nil, fmt.Errorf("no TPU device found in %s or %s: %w", devDirectory, devDirectoryVfio, errNoTPUDetected)
 }
 
-// countAccelDevices counts the /dev/accel<n> devices exposed by the TPU driver.
-func countAccelDevices(devDir string) int {
+// accelChips lists the /dev/accel<n> devices exposed by the TPU driver, one
+// chip each, in device number order.
+func accelChips(devDir string) []tpuChip {
 	entries, err := os.ReadDir(devDir)
 	if err != nil {
 		klog.V(3).Infof("Cannot read %s: %v", devDir, err)
-		return 0
+		return nil
 	}
-	count := 0
+	var names []string
 	for _, entry := range entries {
 		if !entry.IsDir() && accelDeviceRegex.MatchString(entry.Name()) {
-			count++
+			names = append(names, entry.Name())
 		}
 	}
-	return count
+	sortByTrailingNumber(names)
+	chips := make([]tpuChip, 0, len(names))
+	for _, name := range names {
+		chips = append(chips, tpuChip{name: name, deviceNodes: []string{name}})
+	}
+	return chips
 }
 
-// countVfioTPUDevices counts the /dev/vfio/<iommu group> devices whose IOMMU
-// group contains a Google TPU chip, and returns the generation of those chips
-// when every one of them agrees on it (an empty generation is a valid
-// agreement: it means none of them could be told apart, see
-// tpuGenerationOfIOMMUGroup). Other devices bound to vfio-pci also show up in
-// /dev/vfio and must not be counted as TPU chips.
-func countVfioTPUDevices(root string) (int, string) {
+// vfioChips lists the TPU chips behind the /dev/vfio/<iommu group> devices,
+// and returns the generation of those chips when every one of them agrees on
+// it (an empty generation is a valid agreement: it means none of them could
+// be told apart, see tpuPCIFunctionOfIOMMUGroup). Other devices bound to
+// vfio-pci also show up in /dev/vfio and must not be counted as TPU chips.
+//
+// The PCI functions of one chip share a PCI slot (domain:bus:device), so the
+// groups are folded by slot: one chip per slot, named after its lowest group,
+// with every group of the slot as a device node. Chips are ordered by that
+// lowest group number.
+func vfioChips(root string) ([]tpuChip, string) {
 	entries, err := os.ReadDir(filepath.Join(root, devDirectoryVfio))
 	if err != nil {
 		klog.V(3).Infof("Cannot read %s: %v", devDirectoryVfio, err)
-		return 0, ""
+		return nil, ""
 	}
-	count := 0
+	groupsBySlot := map[string][]string{}
+	var slots []string
 	var generation string
 	sawGeneration := false
 	mixed := false
@@ -201,11 +283,14 @@ func countVfioTPUDevices(root string) (int, string) {
 		if entry.IsDir() || !vfioGroupRegex.MatchString(entry.Name()) {
 			continue
 		}
-		gen, ok := tpuGenerationOfIOMMUGroup(root, entry.Name())
+		slot, gen, ok := tpuPCIFunctionOfIOMMUGroup(root, entry.Name())
 		if !ok {
 			continue
 		}
-		count++
+		if _, seen := groupsBySlot[slot]; !seen {
+			slots = append(slots, slot)
+		}
+		groupsBySlot[slot] = append(groupsBySlot[slot], entry.Name())
 		switch {
 		case !sawGeneration:
 			generation = gen
@@ -216,22 +301,50 @@ func countVfioTPUDevices(root string) (int, string) {
 	}
 	if mixed {
 		klog.Warningf("IOMMU groups in %s report more than one TPU generation, ignoring all of them", devDirectoryVfio)
-		return count, ""
+		generation = ""
 	}
-	return count, generation
+
+	chips := make([]tpuChip, 0, len(slots))
+	for _, slot := range slots {
+		groups := groupsBySlot[slot]
+		sortByTrailingNumber(groups)
+		if want := pciFunctionsPerChip(generation); generation != "" && len(groups) != want {
+			klog.Warningf("TPU chip at PCI slot %s has %d vfio devices %v, a %s chip is expected to have %d", slot, len(groups), groups, generation, want)
+		}
+		chips = append(chips, tpuChip{name: groups[0], deviceNodes: groups})
+	}
+	sort.SliceStable(chips, func(i, j int) bool {
+		return trailingNumber(chips[i].name) < trailingNumber(chips[j].name)
+	})
+	return chips, generation
 }
 
-// tpuGenerationOfIOMMUGroup reports whether the IOMMU group holds a Google TPU
-// chip and, if this driver recognizes its PCI ids, its generation. A device
-// with Google's vendor id that is not in knownNonTPUGoogleDeviceIDs is assumed
-// to be a TPU of an unrecognized generation rather than ignored, so that a
-// chip this driver predates is still counted; completeLabelsFromHardware (see
-// util.go) then falls back to the usual sources for its accelerator string.
-func tpuGenerationOfIOMMUGroup(root, group string) (string, bool) {
+// sortByTrailingNumber sorts device names such as "accel10" or "10" by their
+// number, so that "2" comes before "10".
+func sortByTrailingNumber(names []string) {
+	sort.SliceStable(names, func(i, j int) bool {
+		return trailingNumber(names[i]) < trailingNumber(names[j])
+	})
+}
+
+func trailingNumber(name string) int {
+	n, _ := strconv.Atoi(strings.TrimLeft(name, "abcdefghijklmnopqrstuvwxyz"))
+	return n
+}
+
+// tpuPCIFunctionOfIOMMUGroup reports whether the IOMMU group holds a PCI
+// function of a Google TPU chip and, if so, the PCI slot (domain:bus:device,
+// without the function) of that chip and, if this driver recognizes its PCI
+// ids, its generation. A device with Google's vendor id that is not in
+// knownNonTPUGoogleDeviceIDs is assumed to be a TPU of an unrecognized
+// generation rather than ignored, so that a chip this driver predates is still
+// counted; completeLabelsFromHardware (see util.go) then falls back to the
+// usual sources for its accelerator string.
+func tpuPCIFunctionOfIOMMUGroup(root, group string) (slot, generation string, ok bool) {
 	devices, err := os.ReadDir(filepath.Join(root, iommuGroupsPath, group, "devices"))
 	if err != nil {
 		klog.V(3).Infof("Cannot read the devices of IOMMU group %s: %v", group, err)
-		return "", false
+		return "", "", false
 	}
 	for _, device := range devices {
 		devicePath := filepath.Join(root, iommuGroupsPath, group, "devices", device.Name())
@@ -255,7 +368,9 @@ func tpuGenerationOfIOMMUGroup(root, group string) (string, bool) {
 		if !ok {
 			klog.V(3).Infof("Google PCI device %s in IOMMU group %s has an unrecognized device id %s, assuming it is a TPU of an unknown generation; add it to tpuGenerationFromPCIIDs if it is not", device.Name(), group, deviceID)
 		}
-		return gen, true
+		// A PCI address is domain:bus:device.function.
+		slot, _, _ := strings.Cut(device.Name(), ".")
+		return slot, gen, true
 	}
-	return "", false
+	return "", "", false
 }

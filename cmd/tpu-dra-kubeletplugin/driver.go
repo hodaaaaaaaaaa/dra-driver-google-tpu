@@ -94,7 +94,7 @@ func NewDriver(ctx context.Context,
 	}
 
 	triggerPublishChan := make(chan interface{}, 1)
-	state, err := NewDeviceState(config, nodeLabels, devDir, triggerPublishChan, sharesPolicy)
+	state, err := NewDeviceState(config, nodeLabels, devDir, hardware.chips, triggerPublishChan, sharesPolicy)
 	if err != nil {
 		return nil, err
 	}

@@ -18,12 +18,9 @@ package main
 
 import (
 	"fmt"
-	"io/fs"
 	"math/rand"
 	"os"
 	"path"
-	"regexp"
-	"strings"
 
 	"github.com/google/uuid"
 	resourceapi "k8s.io/api/resource/v1"
@@ -33,9 +30,9 @@ import (
 )
 
 const (
-	tpuV4DeviceRegex        = `^accel[0-9]*$`
-	tpuDeviceNumericalRegex = `^\d+$`
-	defaultDeviceID         = "vfio"
+	// vfioContainerDevice is the vfio container node, /dev/vfio/vfio, that a
+	// container needs next to the group nodes of a chip bound to vfio-pci.
+	vfioContainerDevice = "vfio"
 	// libtpuLogDir is the host path that libtpu writes its logs to. It is shared by
 	// every claim on the node and tailed by the log collector sidecar.
 	libtpuLogDir     = "/tmp/tpu_logs"
@@ -46,8 +43,11 @@ const (
 type AllocatableDevices map[string]*AllocatableDevice
 
 type AllocatableDevice struct {
-	UUID          string `json:"uuid"`
-	name          string
+	UUID string `json:"uuid"`
+	name string
+	// deviceNodes are the chip's device files inside the manager's
+	// DevDirectory, all of which must be present for the chip to be healthy.
+	deviceNodes   []string
 	index         int
 	tpuGen        string
 	brand         string
@@ -63,6 +63,9 @@ type AllocatableDevice struct {
 type tpuManager struct {
 	DevDirectory string
 	tpuGen       string
+	// chips are the chips found on the host (see probeTPUHardware), one
+	// published device each.
+	chips        []tpuChip
 	devices      AllocatableDevices
 	tpuChipCount int
 	nodeLabels   map[string]string
@@ -71,7 +74,8 @@ type tpuManager struct {
 	tpuLogDir    string
 }
 
-func NewTPUManager(nodeLabels map[string]string, devDirectory string) (*tpuManager, error) {
+// NewTPUManager builds the manager for the chips found in devDirectory.
+func NewTPUManager(nodeLabels map[string]string, devDirectory string, chips []tpuChip) (*tpuManager, error) {
 	accelerator := nodeLabels[AcceleratorLabel]
 	acceleratorCount := nodeLabels[AcceleratorCountLabel]
 	topology := nodeLabels[TopologyLabel]
@@ -89,8 +93,7 @@ func NewTPUManager(nodeLabels map[string]string, devDirectory string) (*tpuManag
 		return nil, fmt.Errorf("cannot determine the number of TPU chips of the node, set --tpu-chip-count or the %s label: %w", AcceleratorCountLabel, err)
 	}
 
-	// Initialize environment variables that will be set in containers requesting TPU resources.
-	// currently only support up to v6e which requires all tpu chips to be allocated to one container
+	// Initialize default node-level environment variables for full-node claims.
 	envs, err := InitEnvs(InitEnvOptions{
 		Accelerator:         accelerator,
 		Topology:            topology,
@@ -113,6 +116,7 @@ func NewTPUManager(nodeLabels map[string]string, devDirectory string) (*tpuManag
 	return &tpuManager{
 		tpuGen:       tpuGen,
 		DevDirectory: devDirectory,
+		chips:        chips,
 		tpuChipCount: chipCount,
 		nodeLabels:   nodeLabels,
 		envs:         envs,
@@ -154,12 +158,13 @@ func (d *AllocatableDevice) GetDevice() resourceapi.Device {
 	return device
 }
 
-func (tm *tpuManager) getTpuInfo(i int, f fs.DirEntry) *AllocatableDevice {
-	uuid := tm.generateUUIDs(deviceUUIDSeed(os.Getenv("NODE_NAME"), f.Name()))
+func (tm *tpuManager) getTpuInfo(i int, chip tpuChip) *AllocatableDevice {
+	uuid := tm.generateUUIDs(deviceUUIDSeed(os.Getenv("NODE_NAME"), chip.name))
 	allocatableDevice := &AllocatableDevice{
-		UUID:  uuid,
-		name:  f.Name(),
-		index: i,
+		UUID:        uuid,
+		name:        chip.name,
+		deviceNodes: chip.deviceNodes,
+		index:       i,
 		// memoryBytes:   memory.Total, Question?
 		tpuGen:        tm.tpuGen,
 		brand:         "Google",
@@ -172,38 +177,20 @@ func (tm *tpuManager) getTpuInfo(i int, f fs.DirEntry) *AllocatableDevice {
 	return allocatableDevice
 }
 
-// Discovers all TPU devices available on the local node by walking tpuManager's devDirectory.
+// enumerateAllPossibleTpuDevices publishes one device per chip found on the
+// local node.
 func (tm *tpuManager) enumerateAllPossibleTpuDevices() (AllocatableDevices, error) {
 	klog.Info("Enumerating all possible Tpu Devices")
-	// The device naming depends on the kernel interface the chips are bound to,
-	// not on the TPU generation, which may be unknown to this driver.
-	reg := regexp.MustCompile(tpuV4DeviceRegex)
-	if tm.DevDirectory == devDirectoryVfio {
-		reg = regexp.MustCompile(tpuDeviceNumericalRegex)
-	}
-	files, err := os.ReadDir(tm.DevDirectory)
-	if err != nil {
-		return nil, err
-	}
-
 	allocatableDevices := make(AllocatableDevices)
-	num_devices := 0
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		if reg.MatchString(f.Name()) {
-			klog.Infof("Found Google TPU %q\n", f.Name())
-			device := tm.getTpuInfo(num_devices, f)
-			allocatableDevices[device.name] = device
-			num_devices++
-		}
+	for i, chip := range tm.chips {
+		klog.Infof("Found Google TPU %q with device nodes %v in %s", chip.name, chip.deviceNodes, tm.DevDirectory)
+		device := tm.getTpuInfo(i, chip)
+		allocatableDevices[device.name] = device
 	}
-	// how to handle this gracefully?
-	if num_devices != tm.tpuChipCount {
-		return nil, fmt.Errorf("found %d TPU devices in %s, the node is expected to have %d chips", num_devices, tm.DevDirectory, tm.tpuChipCount)
+	if len(tm.chips) != tm.tpuChipCount {
+		return nil, fmt.Errorf("found %d TPU chips in %s, the node is expected to have %d chips", len(tm.chips), tm.DevDirectory, tm.tpuChipCount)
 	}
-	klog.Info("Number of devices discovered", num_devices)
+	klog.Infof("Number of devices discovered: %d", len(tm.chips))
 	tm.devices = allocatableDevices
 	return allocatableDevices, nil
 }
@@ -235,30 +222,80 @@ func hash(s string) int64 {
 	return h
 }
 
-// DeviceSpec returns the device spec that inclues list of devices to allocate for a deviceID.
+// DeviceNodeContainerEdits returns the device nodes a container needs to use
+// the chip published as deviceID: every device node of the chip and, for chips
+// bound to vfio-pci, the vfio container node.
 func (tm *tpuManager) DeviceNodeContainerEdits(deviceID string) []*cdispec.DeviceNode {
-	deviceNodes := make([]*cdispec.DeviceNode, 0)
-	// default device mount
-	deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
-		Path:        path.Join(tm.DevDirectory, deviceID),
-		HostPath:    path.Join(tm.DevDirectory, deviceID),
-		Permissions: "mrw",
-	})
-	// Currently v5 & v6 devices have this extra device that needs to be included.
-	if strings.HasPrefix(tm.tpuGen, "v5") || strings.HasPrefix(tm.tpuGen, "v6e") {
+	var names []string
+	for _, chip := range tm.chips {
+		if chip.name == deviceID {
+			names = append(names, chip.deviceNodes...)
+		}
+	}
+	if len(names) == 0 {
+		klog.Errorf("No device nodes known for TPU device %q", deviceID)
+		return nil
+	}
+	if tm.DevDirectory == devDirectoryVfio {
+		names = append(names, vfioContainerDevice)
+	}
+	deviceNodes := make([]*cdispec.DeviceNode, 0, len(names))
+	for _, name := range names {
 		deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
-			Path:        path.Join(tm.DevDirectory, defaultDeviceID),
-			HostPath:    path.Join(tm.DevDirectory, defaultDeviceID),
+			Path:        path.Join(tm.DevDirectory, name),
+			HostPath:    path.Join(tm.DevDirectory, name),
 			Permissions: "mrw",
 		})
 	}
 	return deviceNodes
 }
 
-// Validate the container requesting for TPUs. Make sure partial TPU chips are not requested.
+// ValidateTpuRequest ensures a claim requests a supported number of TPU chips on this node.
 func (tm *tpuManager) ValidateTpuRequest(requestDeviceIds []string) error {
-	if len(requestDeviceIds) != tm.tpuChipCount {
-		return fmt.Errorf("invalid TPU chip count request, you must request all %d chips on this node together", tm.tpuChipCount)
+	n := len(requestDeviceIds)
+	if n == tm.tpuChipCount {
+		return nil
 	}
-	return nil
+	if n == 1 && tm.allowsSingleChipAllocation() {
+		return nil
+	}
+	if tm.allowsSingleChipAllocation() && tm.tpuChipCount != 1 {
+		return fmt.Errorf("invalid TPU chip count request (%d): must request either 1 chip or all %d chips on this node", n, tm.tpuChipCount)
+	}
+	return fmt.Errorf("invalid TPU chip count request (%d): you must request all %d chips on this node together", n, tm.tpuChipCount)
+}
+
+// allowsSingleChipAllocation reports whether this node supports allocating a
+// single TPU chip to a ResourceClaim. Only single-host nodes of generations
+// marked singleChipAllocatable in tpuGenerationFamilies allow 1-chip claims.
+func (tm *tpuManager) allowsSingleChipAllocation() bool {
+	if tm == nil || !supportsSingleChipAllocation(tm.tpuGen) {
+		return false
+	}
+	if len(tm.nodeLabels) == 0 {
+		return true
+	}
+	return isSingleHostNode(tm.nodeLabels)
+}
+
+// envsForClaim returns the TPU environment variables to inject for a claim
+// that was allocated numChips chips on this node.
+func (tm *tpuManager) envsForClaim(numChips int) (map[string]string, error) {
+	if tm == nil {
+		return nil, nil
+	}
+	if numChips == tm.tpuChipCount || len(tm.nodeLabels) == 0 {
+		return tm.envs, nil
+	}
+	if numChips == 1 && tm.allowsSingleChipAllocation() {
+		return InitEnvs(InitEnvOptions{
+			Accelerator:         tm.nodeLabels[AcceleratorLabel],
+			Topology:            "1x1x1",
+			ChipCount:           1,
+			AcceleratorCount:    1,
+			RequestedChipCount:  1,
+			EnableICIResiliency: tm.nodeLabels[ICIResiliency],
+		})
+	}
+	return nil, fmt.Errorf("unsupported TPU chip count %d for node with %d chips", numChips, tm.tpuChipCount)
 }

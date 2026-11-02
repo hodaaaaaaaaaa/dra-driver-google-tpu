@@ -261,9 +261,21 @@ func TestAcceleratorGen(t *testing.T) {
 			wantErr:     true,
 		},
 		{
+			name:        "new-style v7x",
+			accelerator: "tpu7x",
+			want:        "v7x",
+			wantErr:     false,
+		},
+		{
+			name:        "new-style v7",
+			accelerator: "tpu7",
+			want:        "v7",
+			wantErr:     false,
+		},
+		{
 			// new-style regex matches but generation is unsupported: #32
 			name:        "unsupported new-style future generation",
-			accelerator: "tpu7x",
+			accelerator: "tpu8",
 			want:        "",
 			wantErr:     true,
 		},
@@ -575,6 +587,24 @@ func TestIsSingleHostNode(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "single-host new-style tpu7x: 1 chip, 1x1x1 topology",
+			labels: map[string]string{
+				AcceleratorLabel:      "tpu7x",
+				TopologyLabel:         "1x1x1",
+				AcceleratorCountLabel: "1",
+			},
+			want: true,
+		},
+		{
+			name: "multi-host new-style tpu7x: 4 chips of a 4x4x4 slice",
+			labels: map[string]string{
+				AcceleratorLabel:      "tpu7x",
+				TopologyLabel:         "4x4x4",
+				AcceleratorCountLabel: "4",
+			},
+			want: false,
+		},
+		{
 			name: "multi-host podslice: 4 chips of a 4x4x4 slice",
 			labels: map[string]string{
 				AcceleratorLabel:      "tpu-v4-podslice",
@@ -867,6 +897,9 @@ func TestWrap(t *testing.T) {
 		{name: "v5p sub-cube does not wrap", gen: "v5p", dims: []int64{2, 2, 1}, want: "false,false,false"},
 		{name: "v6e wraps only at the max dim", gen: "v6e", dims: []int64{vlpMaxTopologyDim, 2, vlpMaxTopologyDim}, want: "true,false,true"},
 		{name: "v6e below max does not wrap", gen: "v6e", dims: []int64{2, 2, 2}, want: "false,false,false"},
+		{name: "v7 cube wraps around", gen: "v7", dims: []int64{4, 4, 4}, want: "true,true,true"},
+		{name: "v7x cube wraps around", gen: "v7x", dims: []int64{4, 4, 4}, want: "true,true,true"},
+		{name: "v7x single chip does not wrap", gen: "v7x", dims: []int64{1, 1, 1}, want: "false,false,false"},
 		{name: "unknown generation errors", gen: "v99", dims: []int64{4, 4, 4}, wantErr: true},
 	}
 	for _, tt := range tests {
@@ -955,6 +988,32 @@ func TestInitEnvs(t *testing.T) {
 			},
 		},
 		{
+			// Expected libtpu runtime environment on a single-chip Ironwood node.
+			name: "single-host tpu7x sets worker and slice envs",
+			opts: InitEnvOptions{
+				Accelerator:        "tpu7x",
+				Topology:           "1x1x1",
+				ChipCount:          1,
+				AcceleratorCount:   1,
+				RequestedChipCount: 1,
+			},
+			want: map[string]string{
+				"TPU_SKIP_MDS_QUERY":        "true",
+				"TPU_TOPOLOGY":              "1x1x1",
+				"TPU_ACCELERATOR_TYPE":      "tpu7x-2",
+				"TPU_TOPOLOGY_ALT":          "false",
+				"ALT":                       "false",
+				"TPU_TOPOLOGY_WRAP":         "false,false,false",
+				"WRAP":                      "false,false,false",
+				"HOST_BOUNDS":               "1,1,1",
+				"TPU_HOST_BOUNDS":           "1,1,1",
+				"CHIPS_PER_HOST_BOUNDS":     "1,1,1",
+				"TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+				"TPU_WORKER_ID":             "0",
+				"TPU_WORKER_HOSTNAMES":      "localhost",
+			},
+		},
+		{
 			name: "invalid accelerator errors",
 			opts: InitEnvOptions{
 				Accelerator: "invalid-tpu",
@@ -984,20 +1043,22 @@ func TestInitEnvs(t *testing.T) {
 
 func TestConvertAcceleratorType(t *testing.T) {
 	tests := []struct {
-		name    string
-		gen     string
-		dims    []int64
-		want    string
-		wantErr bool
+		name        string
+		accelerator string
+		gen         string
+		dims        []int64
+		want        string
+		wantErr     bool
 	}{
-		{name: "lite gen is 1 core per chip", gen: "v4lite", dims: []int64{2, 2, 1}, want: "v4lite-4"},
-		{name: "v6e is treated as lite", gen: "v6e", dims: []int64{2, 2, 1}, want: "v6e-4"},
-		{name: "non-lite is 2 cores per chip", gen: "v4", dims: []int64{2, 2, 1}, want: "v4-8"},
-		{name: "invalid topology errors", gen: "v4", dims: []int64{0, 2}, wantErr: true},
+		{name: "lite gen is 1 core per chip", accelerator: "tpu-v4-lite-podslice", gen: "v4lite", dims: []int64{2, 2, 1}, want: "v4lite-4"},
+		{name: "v6e is treated as lite", accelerator: "tpu-v6e-slice", gen: "v6e", dims: []int64{2, 2, 1}, want: "v6e-4"},
+		{name: "non-lite is 2 cores per chip", accelerator: "tpu-v4-podslice", gen: "v4", dims: []int64{2, 2, 1}, want: "v4-8"},
+		{name: "new-style names keep the accelerator name", accelerator: "tpu7x", gen: "v7x", dims: []int64{1, 1, 1}, want: "tpu7x-2"},
+		{name: "invalid topology errors", accelerator: "tpu-v4-podslice", gen: "v4", dims: []int64{0, 2}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := convertAcceleratorType(tt.gen, tt.dims)
+			got, err := convertAcceleratorType(tt.accelerator, tt.gen, tt.dims)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("convertAcceleratorType(%q, %v) expected error", tt.gen, tt.dims)
@@ -1129,6 +1190,20 @@ func TestMapTpuEnvToLabels(t *testing.T) {
 				AcceleratorLabel:      "tpu-v3-device",
 				AcceleratorCountLabel: "4",
 				TopologyLabel:         "2x2",
+				ICIResiliency:         "",
+			},
+		},
+		{
+			name: "new-style tpu7x strips core count suffix",
+			envMap: map[string]string{
+				"ACCELERATOR_TYPE":      "tpu7x-8",
+				"CHIPS_PER_HOST_BOUNDS": "2,2,1",
+				"TOPOLOGY":              "2x2x1",
+			},
+			want: map[string]string{
+				AcceleratorLabel:      "tpu7x",
+				AcceleratorCountLabel: "4",
+				TopologyLabel:         "2x2x1",
 				ICIResiliency:         "",
 			},
 		},

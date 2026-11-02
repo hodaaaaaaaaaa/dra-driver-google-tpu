@@ -407,6 +407,12 @@ spec:
 The GKE node labels (`cloud.google.com/gke-tpu-accelerator` and friends) are
 still read as an input when the platform sets them.
 
+A device is always one chip. On Ironwood (`tpu7x`) a chip is two PCI functions,
+each with its own `/dev/vfio/<group>` node; the driver publishes the chip once,
+named after its first group, and injects both nodes into the container. On
+single-host Ironwood nodes, a `ResourceClaim` can request either a single chip
+(`count: 1`) or all chips on the node.
+
 ### Google Cloud specific containers
 
 The `tpu-network-optimization` init container, the `sidecar-log-collector` and

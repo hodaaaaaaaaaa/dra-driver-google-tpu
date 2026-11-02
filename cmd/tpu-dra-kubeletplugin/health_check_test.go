@@ -40,24 +40,32 @@ func TestNewTPUHealthCheckerClonesDevices(t *testing.T) {
 
 func TestDeviceExists(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "vfio0"), []byte{}, 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	for _, name := range []string{"0", "1"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte{}, 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
 	}
 	hc := NewTPUHealthChecker(AllocatableDevices{}, nil, dir, "v6e", nil)
 
-	present, err := hc.deviceExists("vfio0")
-	if err != nil {
-		t.Fatalf("deviceExists(present): %v", err)
+	tests := []struct {
+		name        string
+		deviceNodes []string
+		want        bool
+	}{
+		{name: "one node present", deviceNodes: []string{"0"}, want: true},
+		{name: "one node missing", deviceNodes: []string{"missing"}, want: false},
+		{name: "all nodes of a chip present", deviceNodes: []string{"0", "1"}, want: true},
+		{name: "one node of a chip missing", deviceNodes: []string{"0", "missing"}, want: false},
 	}
-	if !present {
-		t.Error("expected existing device to report present")
-	}
-
-	absent, err := hc.deviceExists("missing")
-	if err != nil {
-		t.Fatalf("deviceExists(absent): %v", err)
-	}
-	if absent {
-		t.Error("expected missing device to report absent")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := hc.deviceExists(AllocatableDevice{name: tt.deviceNodes[0], deviceNodes: tt.deviceNodes})
+			if err != nil {
+				t.Fatalf("deviceExists: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("deviceExists(%v) = %v, want %v", tt.deviceNodes, got, tt.want)
+			}
+		})
 	}
 }

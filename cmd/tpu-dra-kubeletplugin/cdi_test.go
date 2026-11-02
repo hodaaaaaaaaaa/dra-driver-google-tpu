@@ -18,11 +18,14 @@ package main
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
+	cdispec "tags.cncf.io/container-device-interface/specs-go"
 )
 
 func newTestCDIHandler(t *testing.T) (*CDIHandler, string) {
@@ -61,7 +64,7 @@ func TestCreateAndDeleteClaimSpecFile(t *testing.T) {
 	devices := PreparedDevices{
 		{Device: kubeletplugin.Device{DeviceName: "dev0"}, ContainerEdits: &cdiapi.ContainerEdits{}},
 	}
-	if err := cdi.CreateClaimSpecFile("claim-uid", devices); err != nil {
+	if err := cdi.CreateClaimSpecFile("claim-uid", devices, map[string]string{"TPU_TOPOLOGY": "1x1x1"}); err != nil {
 		t.Fatalf("CreateClaimSpecFile: %v", err)
 	}
 
@@ -74,6 +77,69 @@ func TestCreateAndDeleteClaimSpecFile(t *testing.T) {
 	}
 	if n := countSpecFiles(t, dir); n != 0 {
 		t.Errorf("expected spec files removed, found %d", n)
+	}
+}
+
+func TestCreateClaimSpecFileInjectsEnvsAndDeviceNodes(t *testing.T) {
+	cdi, dir := newTestCDIHandler(t)
+	if err := cdi.CreateCommonSpecFile(nil, nil); err != nil {
+		t.Fatalf("CreateCommonSpecFile: %v", err)
+	}
+
+	devices := PreparedDevices{
+		{
+			Device: kubeletplugin.Device{DeviceName: "2"},
+			ContainerEdits: &cdiapi.ContainerEdits{
+				ContainerEdits: &cdispec.ContainerEdits{
+					DeviceNodes: []*cdispec.DeviceNode{
+						{Path: "/dev/vfio/2", HostPath: "/dev/vfio/2", Type: "c", Major: 240, Minor: 2, Permissions: "mrw"},
+						{Path: "/dev/vfio/3", HostPath: "/dev/vfio/3", Type: "c", Major: 240, Minor: 3, Permissions: "mrw"},
+						{Path: "/dev/vfio/vfio", HostPath: "/dev/vfio/vfio", Type: "c", Major: 10, Minor: 196, Permissions: "mrw"},
+					},
+				},
+			},
+		},
+	}
+	claimEnvs := map[string]string{
+		"TPU_ACCELERATOR_TYPE":      "tpu7x-2",
+		"TPU_TOPOLOGY":              "1x1x1",
+		"TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+	}
+	if err := cdi.CreateClaimSpecFile("claim-uid", devices, claimEnvs); err != nil {
+		t.Fatalf("CreateClaimSpecFile: %v", err)
+	}
+
+	readerCache, err := cdiapi.NewCache(cdiapi.WithSpecDirs(dir), cdiapi.WithAutoRefresh(false))
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	if err := readerCache.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	ociSpec := &specs.Spec{Process: &specs.Process{}, Linux: &specs.Linux{}}
+	unresolved, err := readerCache.InjectDevices(ociSpec, cdi.GetClaimDevices("claim-uid", []string{"2"})...)
+	if err != nil {
+		t.Fatalf("InjectDevices: %v (unresolved=%v)", err, unresolved)
+	}
+	for _, wantEnv := range []string{
+		"DRA_RESOURCE_DRIVER_NAME=" + DriverName,
+		"TPU_ACCELERATOR_TYPE=tpu7x-2",
+		"TPU_TOPOLOGY=1x1x1",
+		"TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
+		"TPU_DEVICE_2_RESOURCE_CLAIM=claim-uid",
+	} {
+		if !slices.Contains(ociSpec.Process.Env, wantEnv) {
+			t.Errorf("injected OCI env %v missing %q", ociSpec.Process.Env, wantEnv)
+		}
+	}
+	var gotDevPaths []string
+	for _, d := range ociSpec.Linux.Devices {
+		gotDevPaths = append(gotDevPaths, d.Path)
+	}
+	wantDevPaths := []string{"/dev/vfio/2", "/dev/vfio/3", "/dev/vfio/vfio"}
+	if !slices.Equal(gotDevPaths, wantDevPaths) {
+		t.Errorf("injected OCI devices = %v, want %v", gotDevPaths, wantDevPaths)
 	}
 }
 

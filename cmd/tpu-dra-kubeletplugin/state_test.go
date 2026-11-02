@@ -547,7 +547,7 @@ func newDeviceStateFixture(t *testing.T) (*Config, map[string]string, string) {
 func TestNewDeviceState(t *testing.T) {
 	config, labels, devDir := newDeviceStateFixture(t)
 
-	state, err := NewDeviceState(config, labels, devDir, make(chan interface{}, 1), consumableSharesPolicy{})
+	state, err := NewDeviceState(config, labels, devDir, singleNodeChips("accel0", "accel1"), make(chan interface{}, 1), consumableSharesPolicy{})
 	if err != nil {
 		t.Fatalf("NewDeviceState: %v", err)
 	}
@@ -577,7 +577,7 @@ func TestNewDeviceStateReusesExistingCheckpoint(t *testing.T) {
 	config, labels, devDir := newDeviceStateFixture(t)
 
 	// First call creates the checkpoint.
-	state, err := NewDeviceState(config, labels, devDir, make(chan interface{}, 1), consumableSharesPolicy{})
+	state, err := NewDeviceState(config, labels, devDir, singleNodeChips("accel0", "accel1"), make(chan interface{}, 1), consumableSharesPolicy{})
 	if err != nil {
 		t.Fatalf("NewDeviceState (first): %v", err)
 	}
@@ -590,7 +590,7 @@ func TestNewDeviceStateReusesExistingCheckpoint(t *testing.T) {
 	}
 
 	// Second call must take the reuse branch, not clobber the checkpoint.
-	if _, err = NewDeviceState(config, labels, devDir, make(chan interface{}, 1), consumableSharesPolicy{}); err != nil {
+	if _, err = NewDeviceState(config, labels, devDir, singleNodeChips("accel0", "accel1"), make(chan interface{}, 1), consumableSharesPolicy{}); err != nil {
 		t.Fatalf("NewDeviceState (reuse): %v", err)
 	}
 
@@ -644,5 +644,133 @@ func TestUpdateHealth(t *testing.T) {
 				t.Errorf("publish signal = %v, want %v", gotSignal, tt.wantSignal)
 			}
 		})
+	}
+}
+
+func TestPrepareAndUnprepareSingleChipOnFourChipV7x(t *testing.T) {
+	t.Setenv("NODE_NAME", "tpu7x-node")
+	devDir := devDirectoryVfio
+	cdiDir := t.TempDir()
+	pluginRoot := t.TempDir()
+	logDir := t.TempDir()
+
+	config := &Config{flags: &Flags{
+		cdiRoot:                     cdiDir,
+		kubeletPluginsDirectoryPath: pluginRoot,
+	}}
+	if err := os.MkdirAll(config.DriverPluginPath(), 0750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	labels := map[string]string{
+		AcceleratorLabel:      "tpu7x",
+		AcceleratorCountLabel: "4",
+		TopologyLabel:         "2x2x1",
+	}
+	chips := []tpuChip{
+		{name: "0", deviceNodes: []string{"0", "1"}},
+		{name: "2", deviceNodes: []string{"2", "3"}},
+		{name: "4", deviceNodes: []string{"4", "5"}},
+		{name: "6", deviceNodes: []string{"6", "7"}},
+	}
+
+	state, err := NewDeviceState(config, labels, devDir, chips, make(chan interface{}, 1), consumableSharesPolicy{})
+	if err != nil {
+		t.Fatalf("NewDeviceState: %v", err)
+	}
+	state.tpuLogDir = logDir
+
+	claimA := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-a", Namespace: "default", UID: "claim-uid-a"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						result(DriverName, "tpu-pool", "0", "tpu"),
+					},
+				},
+			},
+		},
+	}
+	claimB := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-b", Namespace: "default", UID: "claim-uid-b"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						result(DriverName, "tpu-pool", "2", "tpu"),
+					},
+				},
+			},
+		},
+	}
+
+	preparedA, err := state.Prepare(context.Background(), claimA)
+	if err != nil {
+		t.Fatalf("Prepare(claimA): %v", err)
+	}
+	if len(preparedA) != 1 || preparedA[0].DeviceName != "0" {
+		t.Fatalf("Prepare(claimA) = %+v, want single device \"0\"", preparedA)
+	}
+
+	preparedB, err := state.Prepare(context.Background(), claimB)
+	if err != nil {
+		t.Fatalf("Prepare(claimB): %v", err)
+	}
+	if len(preparedB) != 1 || preparedB[0].DeviceName != "2" {
+		t.Fatalf("Prepare(claimB) = %+v, want single device \"2\"", preparedB)
+	}
+
+	// Verify claimB's CDI spec configures a 1-chip topology and mounts both VFIO groups.
+	specBytes, err := os.ReadFile(claimSpecPath(cdiDir, "claim-uid-b"))
+	if err != nil {
+		t.Fatalf("ReadFile claim-uid-b spec: %v", err)
+	}
+	var spec cdispec.Spec
+	if err := yaml.Unmarshal(specBytes, &spec); err != nil {
+		t.Fatalf("Unmarshal spec: %v", err)
+	}
+	for _, wantEnv := range []string{
+		"TPU_ACCELERATOR_TYPE=tpu7x-2",
+		"TPU_TOPOLOGY=1x1x1",
+		"TPU_CHIPS_PER_HOST_BOUNDS=1,1,1",
+		"TPU_HOST_BOUNDS=1,1,1",
+		"TPU_WORKER_ID=0",
+		"TPU_WORKER_HOSTNAMES=localhost",
+	} {
+		if !slices.Contains(spec.ContainerEdits.Env, wantEnv) {
+			t.Errorf("claim CDI spec env %v missing %q", spec.ContainerEdits.Env, wantEnv)
+		}
+	}
+	if len(spec.Devices) != 1 {
+		t.Fatalf("expected 1 CDI device in claimB spec, got %d", len(spec.Devices))
+	}
+	var gotPaths []string
+	for _, dn := range spec.Devices[0].ContainerEdits.DeviceNodes {
+		gotPaths = append(gotPaths, dn.Path)
+	}
+	wantPaths := []string{"/dev/vfio/2", "/dev/vfio/3", "/dev/vfio/vfio"}
+	if !slices.Equal(gotPaths, wantPaths) {
+		t.Errorf("claimB device nodes = %v, want %v", gotPaths, wantPaths)
+	}
+
+	// Unpreparing claimA while claimB is still prepared must keep /tmp/tpu_logs intact.
+	marker := filepath.Join(logDir, "tpu_driver.INFO")
+	if err := os.WriteFile(marker, []byte("live log"), 0o600); err != nil {
+		t.Fatalf("WriteFile marker: %v", err)
+	}
+	if err := state.Unprepare(context.Background(), "claim-uid-a"); err != nil {
+		t.Fatalf("Unprepare(claimA): %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("log file removed while co-tenant 1-chip claimB was still prepared: %v", err)
+	}
+
+	// Unpreparing the last claim cleans up the log directory.
+	if err := state.Unprepare(context.Background(), "claim-uid-b"); err != nil {
+		t.Fatalf("Unprepare(claimB): %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("expected log file to be removed after last claim unprepared, stat err = %v", err)
 	}
 }

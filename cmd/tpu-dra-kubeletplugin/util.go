@@ -113,8 +113,8 @@ var (
 	}
 )
 
-// InitEnvOptions contains fields that are required to initiliazing the
-// environment variables used by tpu-device-plugin.
+// InitEnvOptions contains fields required to initialize the environment
+// variables consumed by TPU workloads.
 type InitEnvOptions struct {
 	Accelerator           string
 	Topology              string
@@ -208,7 +208,7 @@ func InitEnvs(opts InitEnvOptions) (map[string]string, error) {
 			return nil, err
 		}
 		// Convert accelerator type to <tpuGeneration>-<numCores> format used by GKE.
-		acceleratorTypeConverted, err = convertAcceleratorType(tpuGen, topologyDims)
+		acceleratorTypeConverted, err = convertAcceleratorType(opts.Accelerator, tpuGen, topologyDims)
 		if err != nil {
 			return nil, err
 		}
@@ -269,16 +269,19 @@ func ChipCount(chipCount string) (int, error) {
 	return count, nil
 }
 
-// TPU accelerator type from node label should be in format:
-// "tpu-<gen>-<device/podslice/slice>".
-// We convert it to "<gen>-<# of cores>" for consumption by
-// libtpu, frameworks, etc.
-func convertAcceleratorType(tpuGen string, topologyDims []int64) (string, error) {
+// convertAcceleratorType returns the accelerator type in the format expected
+// by libtpu and ML frameworks: <generation>-<cores> (v6e-4), or
+// <accelerator>-<cores> for new-style accelerator names (tpu7x-2).
+func convertAcceleratorType(accelerator, tpuGen string, topologyDims []int64) (string, error) {
 	cores, err := numCores(tpuGen, topologyDims)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s-%d", tpuGen, cores), nil
+	name := tpuGen
+	if acceleratorRegex.MatchString(accelerator) {
+		name = accelerator
+	}
+	return fmt.Sprintf("%s-%d", name, cores), nil
 }
 
 // AcceleratorGen obtains the generation (v3, v4, v4lite, etc.)
@@ -290,6 +293,8 @@ func convertAcceleratorType(tpuGen string, topologyDims []int64) (string, error)
 // accelerator: tpu-v5-lite-podslice; return: v5litepod
 // accelerator: tpu-v5p-slice; return: v5p
 // accelerator: tpu-v6e-slice; return: v6e
+// accelerator: tpu7x; return: v7x
+// accelerator: tpu7; return: v7
 // reference: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/plan-tpus#standard
 //
 // The generations it can return, and how to add a new one, are defined by
@@ -298,7 +303,8 @@ func AcceleratorGen(accelerator string) (string, error) {
 	var gen string
 	switch {
 	case acceleratorRegex.MatchString(accelerator):
-		gen = accelerator
+		// New-style names (from Ironwood on) drop the dash and the "v".
+		gen = "v" + strings.TrimPrefix(accelerator, "tpu")
 	case pastAcceleratorRegex.MatchString(accelerator):
 		// Edge cases that match regex but are not valid accelerator types.
 		if accelerator == "tpu-v4-device" || accelerator == "tpu-v4-lite-podslice" {
@@ -516,7 +522,7 @@ func isSingleHostNode(nodeLabels map[string]string) bool {
 
 func wrap(tpuGen string, topologyDims []int64) (string, error) {
 	switch tpuGen {
-	case "v3", "v4", "v4lite", "v5p":
+	case "v3", "v4", "v4lite", "v5p", "v7", "v7x":
 		return wrapVersion(topologyDims), nil
 	case "v5lite", "v5litepod", "v6e":
 		return wrapLitePod(topologyDims), nil
@@ -542,8 +548,11 @@ func wrapLitePod(topologyDims []int64) string {
 	return strings.Join(val, ",")
 }
 
+// isPodslice reports whether the accelerator is a slice, i.e. gets the slice
+// topology environment. New-style accelerator names (tpu7x) only come as
+// slices.
 func isPodslice(accelerator string) bool {
-	return strings.HasSuffix(accelerator, "slice")
+	return strings.HasSuffix(accelerator, "slice") || acceleratorRegex.MatchString(accelerator)
 }
 
 func cubeOrLarger(topologyDims []int64) bool {
@@ -661,6 +670,11 @@ func mapTpuEnvToLabels(envMap map[string]string) map[string]string {
 		accelerator = "tpu-v3-device"
 	default:
 		accelerator = accelTypeLower // fallback
+		if prefix, cores, ok := strings.Cut(accelTypeLower, "-"); ok && acceleratorRegex.MatchString(prefix) {
+			if _, err := strconv.Atoi(cores); err == nil {
+				accelerator = prefix
+			}
+		}
 	}
 
 	// Determine chip count from CHIPS_PER_HOST_BOUNDS product
@@ -869,7 +883,7 @@ func completeLabelsFromHardware(labels map[string]string, hardware *tpuHardware)
 	// Cross-check against the generation read from the PCI id (see
 	// tpuGenerationFromPCIIDs in hardware.go), when the hardware could tell it.
 	if hardware.generation != "" && labels[AcceleratorLabel] != "" {
-		if gen, err := AcceleratorGen(labels[AcceleratorLabel]); err == nil && gen != hardware.generation {
+		if gen, err := AcceleratorGen(labels[AcceleratorLabel]); err == nil && !sameTPUGenerationFamily(gen, hardware.generation) {
 			klog.Warningf("Node is labeled with accelerator %q (generation %s) but its PCI id says generation %s", labels[AcceleratorLabel], gen, hardware.generation)
 		}
 	}

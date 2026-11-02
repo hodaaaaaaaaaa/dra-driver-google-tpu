@@ -67,10 +67,10 @@ func (s *DeviceState) logDir() string {
 	return libtpuLogDir
 }
 
-func NewDeviceState(config *Config, nodeLabels map[string]string, devDir string, publishChan chan interface{}, sharesPolicy consumableSharesPolicy) (*DeviceState, error) {
+func NewDeviceState(config *Config, nodeLabels map[string]string, devDir string, chips []tpuChip, publishChan chan interface{}, sharesPolicy consumableSharesPolicy) (*DeviceState, error) {
 	klog.Info("Creating new DeviceState")
 
-	tm, err := NewTPUManager(nodeLabels, devDir)
+	tm, err := NewTPUManager(nodeLabels, devDir, chips)
 	if err != nil {
 		return nil, fmt.Errorf("error creating the TPU manager: %w", err)
 	}
@@ -84,7 +84,7 @@ func NewDeviceState(config *Config, nodeLabels map[string]string, devDir string,
 		return nil, fmt.Errorf("unable to create CDI handler: %v", err)
 	}
 
-	err = cdi.CreateCommonSpecFile(tm.envs, tm.commonMounts)
+	err = cdi.CreateCommonSpecFile(nil, tm.commonMounts)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create CDI spec file for common edits: %v", err)
 	}
@@ -137,7 +137,11 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	preparedClaims := checkpoint.V1.PreparedClaims
 	if restoredDevices := preparedClaims[claimUID]; restoredDevices != nil {
 		klog.Infof("restoring claim %v from checkpoint", claimUID)
-		if err := s.cdi.CreateClaimSpecFile(claimUID, restoredDevices); err != nil {
+		claimEnvs, err := s.tm.envsForClaim(len(restoredDevices))
+		if err != nil {
+			return nil, fmt.Errorf("unable to compute environment for restored claim %v: %w", claimUID, err)
+		}
+		if err := s.cdi.CreateClaimSpecFile(claimUID, restoredDevices, claimEnvs); err != nil {
 			return nil, fmt.Errorf("unable to recreate CDI spec file for claim %v from checkpoint: %w", claimUID, err)
 		}
 		return restoredDevices.GetDevices(), nil
@@ -148,7 +152,12 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		return nil, fmt.Errorf("prepare failed for claim %v: %v", claimUID, err)
 	}
 
-	if err = s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
+	claimEnvs, err := s.tm.envsForClaim(len(preparedDevices))
+	if err != nil {
+		return nil, fmt.Errorf("unable to compute environment for claim %v: %w", claimUID, err)
+	}
+
+	if err = s.cdi.CreateClaimSpecFile(claimUID, preparedDevices, claimEnvs); err != nil {
 		return nil, fmt.Errorf("unable to create CDI spec file for claim: %v", err)
 	}
 
@@ -204,15 +213,17 @@ func (s *DeviceState) prepareDevices(claim *resourceapi.ResourceClaim) (Prepared
 	// driver is neither part of the chip count nor findable in s.allocatable,
 	// and result.Driver is the only authoritative statement of ownership.
 	var results []resourceapi.DeviceRequestAllocationResult
+	var requestedIDs []string
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		if result.Driver != DriverName {
 			continue
 		}
 		results = append(results, result)
+		requestedIDs = append(requestedIDs, result.Device)
 	}
 
-	if len(results) != s.tm.tpuChipCount {
-		return nil, fmt.Errorf("invalid tpu resourceClaim, claim requests partial tpu devices (%d), only requests for all tpu devices (%d) on the node are supported", len(results), s.tm.tpuChipCount)
+	if err := s.tm.ValidateTpuRequest(requestedIDs); err != nil {
+		return nil, fmt.Errorf("invalid tpu resourceClaim: %w", err)
 	}
 	// Look through the configs and figure out which one will be applied to
 	// each device allocation result based on their order of precedence.
@@ -252,12 +263,12 @@ func (s *DeviceState) prepareDevices(claim *resourceapi.ResourceClaim) (Prepared
 //
 // The libtpu log directory is a single host path shared by every claim on the
 // node, and it is tailed by the log collector sidecar. Removing its contents on
-// every unprepare is only safe while a single claim can hold the chips. When
-// consumable shares is enabled, the contents are removed by whichever claim is
-// the last one out.
+// every unprepare is only safe while a single claim can hold chips on the node.
+// When consumable shares or single-chip allocation allows co-tenant claims, the
+// contents are removed by whichever claim is the last one out.
 func (s *DeviceState) unprepareDevices(claimUID string, checkpoint *Checkpoint) error {
 	logDir := s.logDir()
-	if s.sharesPolicy.enabled && hasOtherPreparedClaims(checkpoint, claimUID) {
+	if (s.sharesPolicy.enabled || (s.tm != nil && s.tm.allowsSingleChipAllocation())) && hasOtherPreparedClaims(checkpoint, claimUID) {
 		klog.V(4).Infof("unprepare: TPU chips are still held by other claims, keeping %s for claim %v",
 			logDir, claimUID)
 		return nil
@@ -273,11 +284,9 @@ func (s *DeviceState) unprepareDevices(claimUID string, checkpoint *Checkpoint) 
 // hasOtherPreparedClaims reports whether a claim other than claimUID is still
 // checkpointed as prepared.
 //
-// Every claim on a TPU node is allocated every chip on it, so the number of
-// prepared claims is a sufficient reference count for the chips; there is no
-// need to track which claim holds which device. Unprepare deletes the claim
-// from the checkpoint only after teardown succeeds, so the claim being torn
-// down is still present here and has to be skipped explicitly.
+// Unprepare deletes the claim from the checkpoint only after teardown succeeds,
+// so the claim being torn down is still present here and has to be skipped
+// explicitly.
 func hasOtherPreparedClaims(checkpoint *Checkpoint, claimUID string) bool {
 	if checkpoint == nil || checkpoint.V1 == nil {
 		return false

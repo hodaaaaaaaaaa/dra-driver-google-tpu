@@ -85,10 +85,9 @@ func (hc *TPUHealthChecker) Start() error {
 	return nil
 }
 
-func (hc *TPUHealthChecker) deviceExists(deviceId string) (bool, error) {
-	deviceIDs := []string{deviceId}
-
-	for _, id := range deviceIDs {
+// deviceExists reports whether every device node of the chip is present.
+func (hc *TPUHealthChecker) deviceExists(d AllocatableDevice) (bool, error) {
+	for _, id := range d.deviceNodes {
 		if _, err := os.Stat(filepath.Join(hc.devDirectory, id)); err == nil {
 			continue
 		} else if os.IsNotExist(err) {
@@ -113,7 +112,7 @@ func (hc *TPUHealthChecker) monitorDevDir() error {
 			return nil
 		case <-ticker.C:
 			for id, d := range hc.devices {
-				val, _ := hc.deviceExists(id)
+				val, _ := hc.deviceExists(d)
 				if val && !d.allocatable {
 					klog.Infof("Device %s is now healthy.", id)
 					d.allocatable = true
